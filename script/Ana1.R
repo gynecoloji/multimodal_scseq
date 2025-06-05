@@ -186,7 +186,7 @@ CoveragePlot(
 
 # save the object
 saveRDS(pbmc, file = str_c(data_save, "pbmc_atac_seurat.rds"))
-saveRDS(pbmc_rna, file = str_c(data_save, "pbmc_rna_seurat.rds")))
+saveRDS(pbmc_rna, file = str_c(data_save, "pbmc_rna_seurat.rds"))
 
 
 
