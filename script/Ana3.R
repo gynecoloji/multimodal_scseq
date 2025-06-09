@@ -1,4 +1,6 @@
 # Detailed Joint scATAC-seq&scRNAseq analysis with Seurat and Signac
+
+# load required packages ---------
 library(Signac)
 library(Seurat)
 library(EnsDb.Hsapiens.v86)
@@ -15,18 +17,28 @@ library(Rsamtools)
 library(AnnotationHub)
 library(stringr)
 library(vroom)
+library(GenomeInfoDb)
 library(ggplot2)
+library(patchwork)
 
-
-
-# Load the data ------------
+# QC for scATACseq ----------
 data_read = "../data/"
 analysis_save = "../analysis/"
 data_save = "../data/"
 counts <- Read10X_h5(str_c(data_read,"pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5"))
 fragpath <- str_c(data_read,"pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz")
 
-# QC for scATACseq ----------
+
+ah <- AnnotationHub()
+query(ah, c("RepeatMasker", "Homo sapiens"))
+repeats_hg38 <- ah[["AH99003"]]
+repeats_hg38 <- repeats_hg38[!grepl("\\?", repeats_hg38$repClass),]
+repeats_hg38 <- repeats_hg38[!grepl("Unknown", repeats_hg38$repClass),]
+# because non-uniform nomenclature for chromosomes except for chr1-22, chrX, chrY and chrM, we just discard them.
+repeats_hg38 <- repeats_hg38[seqnames(repeats_hg38) %in% c(paste0("chr", 1:22), "chrX", "chrY", "chrM"),]
+repeats_hg38 <- keepSeqlevels(repeats_hg38, c(paste0("chr", 1:22), "chrX", "chrY", "chrM"), pruning.mode = "coarse")
+
+
 # QC using peaks -----------
 peak_names <- rownames(counts$Peaks)
 
@@ -37,6 +49,8 @@ parse_coordinates <- function(coord_strings) {
   
   # Extract components
   chr <- sapply(parts, `[`, 1)
+  
+  
   start <- as.numeric(sapply(parts, `[`, 2))
   end <- as.numeric(sapply(parts, `[`, 3))
   
@@ -50,26 +64,25 @@ parse_coordinates <- function(coord_strings) {
 }
 
 peak_gr <- parse_coordinates(peak_names)
+seqlevels(peak_gr)[seqlevels(peak_gr) == "chrMT"] <- "chrM"
 peak_chrs <- sapply(strsplit(peak_names, ":"), `[`, 1)
 
 ## cell level ---------
 ### check peaks within standard chr --------------
-# Define chromosomes to keep
+# Define chromosomes to keep for research
 chromosomes_to_keep <- c(paste0("chr", 1:22), "chrX")
 
 # Create logical vector for peaks to keep
 peaks_keep <- peak_chrs %in% chromosomes_to_keep
 
 peak_std_chr_ratio = Matrix::colSums(keep_peaks <- counts$Peaks[peaks_keep, ])/Matrix::colSums(counts$Peaks)
-df_peak_qc = as.data.frame(peak_std_chr_ratio)
+df_peak_qc_cell_lvl = as.data.frame(peak_std_chr_ratio)
+colnames(df_peak_qc_cell_lvl) <- 'std_chr'
 
 ### check peaks within genomic repetitive elements (filtering is controversial)--------------
-ah <- AnnotationHub()
-query(ah, c("RepeatMasker", "Homo sapiens"))
-repeats_hg38 <- ah[["AH99003"]]
-repeats_hg38 <- repeats_hg38[!grepl("\\?", repeats_hg38$repClass),]
 
-summarize_rep_func1 = function(peak_gr, 
+
+calculate_repetitive_element_ratios_by_category = function(peak_gr, 
                                repeats_hg38, 
                                peak_matrix, 
                                Category='all'){
@@ -103,7 +116,7 @@ summarize_rep_func1 = function(peak_gr,
   return(peak_ratio)
 }
 
-summarize_rep_func2 = function(peak_gr, 
+calculate_individual_repeat_type_ratios = function(peak_gr, 
                                repeats_hg38, 
                                peak_matrix){
   # all types
@@ -134,73 +147,46 @@ summarize_rep_func2 = function(peak_gr,
 }
 
 
-peak_ratio_all <- summarize_rep_func1(
-  peak_gr = peak_gr,
-  repeats_hg38 = repeats_hg38,
-  peak_matrix = counts$Peaks,
-  Category = 'all'
-)
+for (i in c('all', 'high_confidence_removes', 'moderate_removes', 'keep_types')) {
+  peak_ratio = calculate_repetitive_element_ratios_by_category(
+    peak_gr = peak_gr,
+    repeats_hg38 = repeats_hg38,
+    peak_matrix = counts$Peaks,
+    Category = i
+  )
+  
+  df_peak_qc_cell_lvl[paste0(i, '_rep')] <- unname(peak_ratio)
+  
+}
 
-peak_ratio_high_confidence_removes <- summarize_rep_func1(
-  peak_gr = peak_gr,
-  repeats_hg38 = repeats_hg38,
-  peak_matrix = counts$Peaks,
-  Category = 'high_confidence_removes'
-)
 
-peak_ratio_moderate_removes <- summarize_rep_func1(
-  peak_gr = peak_gr,
-  repeats_hg38 = repeats_hg38,
-  peak_matrix = counts$Peaks,
-  Category = 'moderate_removes'
-)
-
-peak_ratio_keep_types <- summarize_rep_func1(
-  peak_gr = peak_gr,
-  repeats_hg38 = repeats_hg38,
-  peak_matrix = counts$Peaks,
-  Category = 'keep_types'
-)
-
-df_rep <- rbind(
-  peak_ratio_all,
-  peak_ratio_high_confidence_removes,
-  peak_ratio_moderate_removes,
-  peak_ratio_keep_types
-)
-rownames(df_rep) = c(
-  "all_rep",
-  "high_confidence_removes_rep",
-  "moderate_removes_rep",
-  "keep_types_rep"
-)
-df_rep = as.data.frame(t(df_rep))
-df_peak_qc <- cbind(df_peak_qc, df_rep)
-
-tmp = summarize_rep_func2(
+tmp = calculate_individual_repeat_type_ratios(
   peak_gr = peak_gr,
   repeats_hg38 = repeats_hg38,
   peak_matrix = counts$Peaks
 )
 
-df_peak_qc <- cbind(df_peak_qc, tmp)
+df_peak_qc_cell_lvl <- cbind(df_peak_qc_cell_lvl, tmp)
 
 
 ### check peaks within MT--------------
-peak_chrmt_ratio = Matrix::colSums(counts$Peaks[peak_chrs %in% c("chrMT"), ])/Matrix::colSums(counts$Peaks)
-df_peak_qc = cbind(df_peak_qc,as.data.frame(peak_chrmt_ratio))
+peak_chrmt_ratio = Matrix::colSums(counts$Peaks[peak_chrs %in% c("chrM"), ])/Matrix::colSums(counts$Peaks)
+tmp = as.data.frame(peak_chrmt_ratio)
+colnames(tmp) <- 'chrmt'
+df_peak_qc_cell_lvl = cbind(df_peak_qc_cell_lvl,tmp)
 
 
 ### check peaks within blacklisted regions --------------
 peaks_keep <- overlapsAny(peak_gr, blacklist_hg38_unified)
 filtered_peaks <- counts$Peaks[peaks_keep, ]
-peak_ratio = Matrix::colSums(filtered_peaks)/Matrix::colSums(counts$Peaks)
-df_peak_qc = cbind(df_peak_qc,as.data.frame(peak_ratio))
-colnames(df_peak_qc)[ncol(df_peak_qc)] <- 'peak_black_ratio'
+peak_bl_ratio = Matrix::colSums(filtered_peaks)/Matrix::colSums(counts$Peaks)
+tmp = as.data.frame(peak_bl_ratio)
+colnames(tmp) <- 'blacklist'
+df_peak_qc_cell_lvl = cbind(df_peak_qc_cell_lvl,tmp)
 
 ### save peak QC results for cells -----------
 write.csv(
-  df_peak_qc,
+  df_peak_qc_cell_lvl,
   file = str_c(data_save, "cell_level_peak_qc.csv"),
   row.names = TRUE
 )
@@ -209,216 +195,189 @@ write.csv(
 
 ## peak level ---------
 df_peak_qc = data.frame(row.names = 'peak_ratio')
-df_peak_qc_peak_name = data.frame(row.names = rownames(counts$Peaks))
+df_peak_qc_peak_lvl = data.frame(row.names = rownames(counts$Peaks))
 
 ### check peaks within standard chr --------------
 chromosomes_to_keep = c(paste0("chr", 1:22), "chrX")
 
 peaks_keep <- seqnames(peak_gr) %in% chromosomes_to_keep
-peak_ratio = sum(peaks_keep)/length(peaks_keep)
-df_peak_qc['peak_std_chr_ratio'] <- peak_ratio
-df_peak_qc_peak_name['peak_std_chr'] <- as.vector(peaks_keep)
+peak_std_chr_ratio = sum(peaks_keep)/length(peaks_keep)
+df_peak_qc['std_chr'] <- peak_std_chr_ratio
+df_peak_qc_peak_lvl['std_chr'] <- as.vector(peaks_keep)
 
 
 ### check peaks within genomic repetitive elements --------------
-summarize_rep_func3 = function(peak_gr, 
-                               repeats_hg38, 
-                               peak_matrix, 
-                               Category='all'){
-  
-  df = data.frame(row.names = 'peak_raio')
-  # Classify repeats by type
-  high_confidence_removes <- c("Simple_repeat", "Low_complexity", "Satellite", 
-                               "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA")
-  
-  moderate_removes <- c("LINE", "SINE", "LTR")  # More controversial
-  
-  keep_types <- c("DNA", "RC")  # Often contain regulatory elements
-  
-  
-  # select specific categories of repetitive elements
-  repeats_hg38 <- switch(Category,
-                         'all' = repeats_hg38,
-                         'high_confidence_removes' = repeats_hg38[repeats_hg38$repClass %in% high_confidence_removes,],
-                         'moderate_removes' = repeats_hg38[repeats_hg38$repClass %in% moderate_removes,],
-                         'keep_types' = repeats_hg38[repeats_hg38$repClass %in% keep_types,],
-                         stop("Invalid category specified.")
+get_repeat_categories <- function() {
+  list(
+    high_confidence_removes = c("Simple_repeat", "Low_complexity", "Satellite", 
+                                "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA"),
+    moderate_removes = c("LINE", "SINE", "LTR"),
+    keep_types = c("DNA", "RC"),
+    all_individual = c("Simple_repeat", "Low_complexity", "Satellite", 
+                       "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA",
+                       "LINE", "SINE", "LTR", "DNA", "RC")
   )
-  
-  
-  # Create logical vector for peaks to keep
-  peaks_keep <- overlapsAny(peak_gr, repeats_hg38)
-  
-  
-  peak_ratio = sum(peaks_keep)/length(peaks_keep)
-  
-  df[paste0(i,'_rep')] <- peak_ratio
-  
-  return(df)
 }
 
-summarize_rep_func4 = function(peak_gr, 
-                               repeats_hg38, 
-                               peak_matrix){
-  # all types
-  categories <- c("Simple_repeat", "Low_complexity", "Satellite", 
-                  "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA",
-                  "LINE", "SINE", "LTR", "DNA", "RC")
+# Filter repeats by category
+filter_repeats_by_category <- function(repeats_hg38, category) {
+  categories <- get_repeat_categories()
   
-  df = data.frame(row.names = 'peak_raio')
-  for (i in categories) {
-    # Select specific category of repetitive elements
-    repeats_subset <- repeats_hg38[repeats_hg38$repClass == i, ]
-    
-    
-    # Create logical vector for peaks to keep
-    peaks_keep <- overlapsAny(peak_gr, repeats_subset)
-    
-    peak_ratio = sum(peaks_keep)/length(peaks_keep)
-    
-    df[paste0(i,'_rep')] <- peak_ratio
+  if (category == "all") {
+    return(repeats_hg38)
   }
   
-  
-  return(df)
-}
-
-summarize_rep_func5 = function(peak_gr, 
-                               repeats_hg38, 
-                               peak_matrix,
-                               df_peak_qc_peak_name,
-                               Category='all'){
-  
-  df = df_peak_qc_peak_name
-  # Classify repeats by type
-  high_confidence_removes <- c("Simple_repeat", "Low_complexity", "Satellite", 
-                               "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA")
-  
-  moderate_removes <- c("LINE", "SINE", "LTR")  # More controversial
-  
-  keep_types <- c("DNA", "RC")  # Often contain regulatory elements
-  
-  
-  # select specific categories of repetitive elements
-  repeats_hg38 <- switch(Category,
-                         'all' = repeats_hg38,
-                         'high_confidence_removes' = repeats_hg38[repeats_hg38$repClass %in% high_confidence_removes,],
-                         'moderate_removes' = repeats_hg38[repeats_hg38$repClass %in% moderate_removes,],
-                         'keep_types' = repeats_hg38[repeats_hg38$repClass %in% keep_types,],
-                         stop("Invalid category specified.")
-  )
-  
-  
-  # Create logical vector for peaks to keep
-  peaks_keep <- overlapsAny(peak_gr, repeats_hg38)
-  df[paste0(i,'_rep')] <- as.vector(peaks_keep)
-  
-  return(df)
-}
-
-summarize_rep_func6 = function(peak_gr, 
-                               repeats_hg38,
-                               df_peak_qc_peak_name,
-                               peak_matrix){
-  # all types
-  categories <- c("Simple_repeat", "Low_complexity", "Satellite", 
-                  "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA",
-                  "LINE", "SINE", "LTR", "DNA", "RC")
-  
-  df = df_peak_qc_peak_name
-  for (i in categories) {
-    # Select specific category of repetitive elements
-    repeats_subset <- repeats_hg38[repeats_hg38$repClass == i, ]
-    
-    
-    # Create logical vector for peaks to keep
-    peaks_keep <- overlapsAny(peak_gr, repeats_subset)
-    
-    df[paste0(i,'_rep')] <- as.vector(peaks_keep)
+  if (!category %in% names(categories)) {
+    stop("Invalid category. Choose from: ", paste(names(categories), collapse = ", "))
   }
   
+  return(repeats_hg38[repeats_hg38$repClass %in% categories[[category]], ])
+}
+
+# Calculate overlap ratios for grouped categories
+calculate_category_ratios <- function(peak_gr, repeats_hg38) {
+  categories <- c("all", "high_confidence_removes", "moderate_removes", "keep_types")
+  
+  ratios <- sapply(categories, function(cat) {
+    filtered_repeats <- filter_repeats_by_category(repeats_hg38, cat)
+    peaks_overlap <- overlapsAny(peak_gr, filtered_repeats)
+    sum(peaks_overlap) / length(peaks_overlap)
+  })
+  
+  # Convert to data frame with descriptive names
+  df <- data.frame(t(ratios))
+  colnames(df) <- paste0(categories, "_rep")
+  rownames(df) <- "peak_ratio"
   
   return(df)
 }
 
-for (i in c('all', 'high_confidence_removes', 'moderate_removes', 'keep_types')) {
-  tmp <- summarize_rep_func3(
-    peak_gr = peak_gr,
-    repeats_hg38 = repeats_hg38,
-    peak_matrix = counts$Peaks,
-    Category = i
+# Calculate overlap ratios for individual repeat types
+calculate_individual_ratios <- function(peak_gr, repeats_hg38) {
+  categories <- get_repeat_categories()$all_individual
+  
+  ratios <- sapply(categories, function(rep_type) {
+    repeats_subset <- repeats_hg38[repeats_hg38$repClass == rep_type, ]
+    peaks_overlap <- overlapsAny(peak_gr, repeats_subset)
+    sum(peaks_overlap) / length(peaks_overlap)
+  })
+  
+  # Convert to data frame with descriptive names
+  df <- data.frame(t(ratios))
+  colnames(df) <- paste0(categories, "_rep")
+  rownames(df) <- "peak_ratio"
+  
+  return(df)
+}
+
+# Add binary overlap indicators for grouped categories
+add_category_indicators <- function(peak_gr, repeats_hg38, df_peaks) {
+  categories <- c("all", "high_confidence_removes", "moderate_removes", "keep_types")
+  
+  for (cat in categories) {
+    filtered_repeats <- filter_repeats_by_category(repeats_hg38, cat)
+    peaks_overlap <- overlapsAny(peak_gr, filtered_repeats)
+    df_peaks[[paste0(cat, "_rep")]] <- as.vector(peaks_overlap)
+  }
+  
+  return(df_peaks)
+}
+
+# Add binary overlap indicators for individual repeat types
+add_individual_indicators <- function(peak_gr, repeats_hg38, df_peaks) {
+  categories <- get_repeat_categories()$all_individual
+  
+  for (rep_type in categories) {
+    repeats_subset <- repeats_hg38[repeats_hg38$repClass == rep_type, ]
+    peaks_overlap <- overlapsAny(peak_gr, repeats_subset)
+    df_peaks[[paste0(rep_type, "_rep")]] <- as.vector(peaks_overlap)
+  }
+  
+  return(df_peaks)
+}
+
+# Main analysis function that combines everything
+analyze_repetitive_elements <- function(peak_gr, repeats_hg38, peak_matrix = NULL, 
+                                        df_peak_annotations = NULL, 
+                                        include_ratios = TRUE, 
+                                        include_indicators = TRUE) {
+  
+  results <- list()
+  
+  # Calculate summary ratios if requested
+  if (include_ratios) {
+    cat("Calculating category ratios...\n")
+    category_ratios <- calculate_category_ratios(peak_gr, repeats_hg38)
+    
+    cat("Calculating individual repeat type ratios...\n")
+    individual_ratios <- calculate_individual_ratios(peak_gr, repeats_hg38)
+    
+    # Combine ratio results
+    results$summary_ratios <- cbind(category_ratios, individual_ratios)
+  }
+  
+  # Add binary indicators if requested and data frame provided
+  if (include_indicators && !is.null(df_peak_annotations)) {
+    cat("Adding category indicators to peak annotations...\n")
+    df_with_categories <- add_category_indicators(peak_gr, repeats_hg38, df_peak_annotations)
+    
+    cat("Adding individual repeat type indicators...\n")
+    df_with_all <- add_individual_indicators(peak_gr, repeats_hg38, df_with_categories)
+    
+    results$annotated_peaks <- df_with_all
+  }
+  
+  # Add summary statistics
+  results$summary_stats <- list(
+    total_peaks = length(peak_gr),
+    total_repeats = length(repeats_hg38),
+    repeat_classes = table(repeats_hg38$repClass)
   )
   
-  df_peak_qc <- cbind(df_peak_qc, tmp)
-  
+  return(results)
 }
 
 
-tmp <- summarize_rep_func4(
+results <- analyze_repetitive_elements(
   peak_gr = peak_gr,
   repeats_hg38 = repeats_hg38,
-  peak_matrix = counts$Peaks
-)
-
-df_peak_qc <- cbind(df_peak_qc, tmp)
-
-
-for (i in c('all', 'high_confidence_removes', 'moderate_removes', 'keep_types')) {
-  df_peak_qc_peak_name <- summarize_rep_func5(
-    peak_gr = peak_gr,
-    repeats_hg38 = repeats_hg38,
-    peak_matrix = counts$Peaks,
-    df_peak_qc_peak_name = df_peak_qc_peak_name,
-    Category = i
-  )
-
-}
-
-
-df_peak_qc_peak_name <- summarize_rep_func6(
-  peak_gr = peak_gr,
-  repeats_hg38 = repeats_hg38,
-  df_peak_qc_peak_name = df_peak_qc_peak_name,
-  peak_matrix = counts$Peaks
+  df_peak_annotations = df_peak_qc_peak_lvl
 )
 
 
-
-
-
-
+df_peak_qc_peak_lvl = results$annotated_peaks
+df_peak_qc = cbind(df_peak_qc,results$summary_ratios)
 
 
 ### check peaks within MT --------------
-peaks_keep <- seqnames(peak_gr) %in% 'chrMT'
-peak_ratio = sum(peaks_keep)/length(peaks_keep)
-df_peak_qc['peak_chrmt_ratio'] <- peak_ratio
-df_peak_qc_peak_name['peak_chrMT'] <- as.vector(peaks_keep)
+peaks_keep <- seqnames(peak_gr) %in% c("chrM")
+peak_chrmt_ratio = sum(peaks_keep)/length(peaks_keep)
+df_peak_qc['chrmt'] <- peak_chrmt_ratio
+df_peak_qc_peak_lvl['chrmt'] <- as.vector(peaks_keep)
 
 ### check peaks within blacklisted regions --------------
 peaks_keep <- overlapsAny(peak_gr, blacklist_hg38_unified)
-peak_ratio = sum(peaks_keep)/length(peaks_keep)
-df_peak_qc['peak_black_ratio'] <- peak_ratio
-df_peak_qc_peak_name['peak_black_ratio'] <- as.vector(peaks_keep)
+peak_bl_ratio = sum(peaks_keep)/length(peaks_keep)
+df_peak_qc['blacklist'] <- peak_bl_ratio
+df_peak_qc_peak_lvl['blacklist'] <- as.vector(peaks_keep)
 
 ### check # of cells expressing corresponding peaks --------------
-peak_cell_ratio = Matrix::rowSums(counts$Peaks > 0)/ncol(counts$Peaks)
-df_peak_qc_peak_name['peak_cell_ratio'] <- unname(peak_cell_ratio)
-df_peak_qc_peak_name['peak_cell'] <- unname(Matrix::rowSums(counts$Peaks > 0))
-df_peak_qc_peak_name['peak_reads'] <- unname(Matrix::rowSums(counts$Peaks))
-df_peak_qc_peak_name['peak_width'] <- width(peak_gr)
+df_peak_qc_peak_lvl['peak_cell_ratio'] <- unname(Matrix::rowSums(counts$Peaks > 0)/ncol(counts$Peaks))
+df_peak_qc_peak_lvl['peak_cell'] <- unname(Matrix::rowSums(counts$Peaks > 0))
+df_peak_qc_peak_lvl['peak_reads'] <- unname(Matrix::rowSums(counts$Peaks))
+df_peak_qc_peak_lvl['peak_width'] <- width(peak_gr)
 
 ### save peak QC results for peaks ---------
 df_peak_qc <- as.data.frame(t(df_peak_qc))
 write.csv(
   df_peak_qc,
-  file = str_c(data_save, "peak_level_peak_qc.csv"),
+  file = str_c(data_save, "peak_level_peak_qc_summary.csv"),
   row.names = TRUE
 )
 
 write.csv(
-  df_peak_qc_peak_name,
-  file = str_c(data_save, "peak_level_peak_qc_peak_name.csv"),
+  df_peak_qc_peak_lvl,
+  file = str_c(data_save, "peak_level_peak_qc.csv"),
   row.names = TRUE
 )
 
@@ -434,18 +393,6 @@ write.csv(
 annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
 seqlevels(annotation) <- paste0('chr', seqlevels(annotation))
 
-ah <- AnnotationHub()
-query(ah, c("RepeatMasker", "Homo sapiens"))
-repeats_hg38 <- ah[["AH99003"]]
-repeats_hg38 <- repeats_hg38[!grepl("\\?", repeats_hg38$repClass),]
-
-# Classify repeats by type
-high_confidence_removes <- c("Simple_repeat", "Low_complexity", "Satellite", 
-                             "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA")
-
-moderate_removes <- c("LINE", "SINE", "LTR")  # More controversial
-
-keep_types <- c("DNA", "RC")  # Often contain regulatory elements
 
 ## create a Seurat object containing the RNA and atac data ---------
 pbmc <- CreateSeuratObject(
@@ -461,7 +408,7 @@ pbmc[["ATAC"]] <- CreateChromatinAssay(
   annotation = annotation
 )
 
-rm(list = 'counts')
+rm(list = c('counts', 'df_peak_qc', 'df_peak_qc_cell_lvl', 'df_peak_qc_peak_lvl','keep_peaks', 'results', 'tmp', 'filtered_peaks'))
 gc()
 gc()
 
@@ -469,6 +416,9 @@ gc()
 
 
 ## get frag information --------
+## In frag_summary, one line represents one fragment and we should use the first column of it to do downstream QC analysis
+## Output of FeatureMatrix() is based on fragment # instead of read # 
+DefaultAssay(pbmc) <- "ATAC"
 frag_summary <- CountFragments(fragments = fragpath, 
                                cells = colnames(pbmc))
 
@@ -476,99 +426,397 @@ frag_summary <- CountFragments(fragments = fragpath,
 cell_barcodes <- colnames(pbmc)
 
 
-data <- vroom("../data/pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz", 
-              delim = "\t", col_names = FALSE)
-data <- data[data$X4 %in% cell_barcodes, ]
+create_granges_from_tsv <- function(file_path, 
+                                    cell_barcodes,
+                                    chunk_size = NULL,
+                                    verbose = TRUE) {
+  
+  if (verbose) {
+    cat("Creating GRanges from:", basename(file_path), "\n")
+    cat("Target cell barcodes:", length(cell_barcodes), "\n")
+  }
+  
+  # Determine if we need chunked reading
+  if (is.null(chunk_size)) {
+    # Try to estimate if chunked reading is needed
+    file_size_mb <- file.size(file_path) / (1024^2)
+    
+    if (file_size_mb > 1000) {  # > 1GB, use chunked reading
+      chunk_size <- 100000
+      if (verbose) cat("Large file detected, using chunked reading\n")
+    }
+  }
+  
+  if (!is.null(chunk_size)) {
+    # Use chunked reading for large files
+    gr <- create_granges_chunked(file_path, cell_barcodes, chunk_size, verbose)
+  } else {
+    # Direct reading for smaller files
+    gr <- create_granges_direct(file_path, cell_barcodes, verbose)
+  }
+  
+  return(gr)
+}
 
-tmp = data$X4
+
+create_granges_direct <- function(file_path, cell_barcodes, verbose = TRUE) {
+  
+  if (verbose) cat("Reading file directly...\n")
+  
+  # Read only first 4 columns
+  data <- vroom(
+    file_path,
+    delim = "\t",
+    col_names = FALSE,
+    col_select = 1:4,
+    col_types = cols(
+      X1 = col_character(),  # chromosome
+      X2 = col_integer(),    # start
+      X3 = col_integer(),    # end  
+      X4 = col_character()   # cell_barcode
+    ),
+    altrep = FALSE,
+    show_col_types = FALSE,
+    progress = verbose
+  )
+  
+  # Filter by cell barcodes
+  filtered_data <- data[data$X4 %in% cell_barcodes, ]
+  
+  # Convert to GRanges
+  if (nrow(filtered_data) == 0) {
+    warning("No rows match the provided cell barcodes!")
+    return(GRanges())
+  }
+  
+  gr <- GRanges(
+    seqnames = filtered_data$X1,
+    ranges = IRanges(start = filtered_data$X2, end = filtered_data$X3),
+    cell_barcode = filtered_data$X4
+  )
+  
+  if (verbose) {
+    cat("Created GRanges with", length(gr), "ranges\n")
+    cat("Unique chromosomes:", length(unique(seqnames(gr))), "\n")
+    cat("Unique cell barcodes:", length(unique(gr$cell_barcode)), "\n")
+  }
+  
+  return(gr)
+}
+
+
+create_granges_chunked <- function(file_path, cell_barcodes, chunk_size, verbose = TRUE) {
+  
+  if (verbose) cat("Using chunked reading with chunk size:", chunk_size, "\n")
+  
+  # Use the helper function to read in chunks
+  filtered_chunks <- read_file_in_chunks(file_path, cell_barcodes, chunk_size, verbose)
+  
+  if (verbose) {
+    cat("Chunked reading complete\n")
+  }
+  
+  # Combine filtered chunks
+  if (length(filtered_chunks) == 0) {
+    warning("No rows match the provided cell barcodes!")
+    return(GRanges())
+  }
+  
+  combined_data <- bind_rows(filtered_chunks)
+  
+  # Convert to GRanges
+  gr <- GRanges(
+    seqnames = combined_data$X1,
+    ranges = IRanges(start = combined_data$X2, end = combined_data$X3),
+    cell_barcode = combined_data$X4
+  )
+  
+  if (verbose) {
+    cat("Created GRanges with", length(gr), "ranges\n")
+    cat("Unique chromosomes:", length(unique(seqnames(gr))), "\n")
+    cat("Unique cell barcodes:", length(unique(gr$cell_barcode)), "\n")
+  }
+  
+  return(gr)
+}
+
+
+read_file_in_chunks <- function(file_path, cell_barcodes, chunk_size, verbose) {
+  
+  # Open file connection
+  con <- file(file_path, "r")
+  on.exit(close(con))
+  
+  filtered_chunks <- list()
+  chunk_number <- 1
+  
+  # Define column types
+  col_spec <- cols(
+    X1 = col_character(),  # chromosome
+    X2 = col_integer(),    # start
+    X3 = col_integer(),    # end
+    X4 = col_character()   # cell_barcode
+  )
+  
+  # Read chunks
+  repeat {
+    chunk_lines <- readLines(con, n = chunk_size)
+    
+    if (length(chunk_lines) == 0) {
+      break
+    }
+    
+    # Parse the chunk
+    chunk_df <- vroom(
+      I(chunk_lines),  # Read from character vector
+      delim = "\t",
+      col_names = FALSE,
+      col_select = 1:4,
+      col_types = col_spec,
+      altrep = FALSE,
+      show_col_types = FALSE
+    )
+    
+    # Filter by cell barcodes
+    chunk_filtered <- chunk_df[chunk_df$X4 %in% cell_barcodes, ]
+    
+    if (nrow(chunk_filtered) > 0) {
+      filtered_chunks[[chunk_number]] <- chunk_filtered
+    }
+    
+    if (verbose && chunk_number %% 10 == 0) {
+      cat("Processed", chunk_number, "chunks\n")
+    }
+    
+    chunk_number <- chunk_number + 1
+  }
+  
+  return(filtered_chunks)
+}
+
+peaks_gr <- create_granges_from_tsv(
+  file_path = fragpath,
+  cell_barcodes = cell_barcodes,
+  verbose = TRUE,
+  chunk_size = 1000000  # Adjust chunk size as needed
+)
+
 gc()
 gc()
 
-data <- GRanges(
-  seqnames = data$X1,
-  ranges = IRanges(start = data$X2, end = data$X3))
-gc()
-gc()
-
-
-
-### overview of fragments information -------
-DefaultAssay(pbmc) <- "ATAC"
-frag_summary <- CountFragments(fragments = fragpath, 
-                       cells = colnames(pbmc))
-
-gc()
-gc()
+identical(frag_summary$CB, cell_barcodes)
+df_frag_qc_cell_lvl = data.frame(row.names = cell_barcodes,
+                                 fragments = frag_summary$frequency_count)
+tmp = peaks_gr$cell_barcode
 
 
 ### check fragments within peaks --------------
-df_peak_frag = overlapsAny(data, granges(pbmc[['ATAC']]))
-df_peak_frag = as.data.frame(table(df_peak_frag, tmp))
-df_peak_frag = df_peak_frag[df_peak_frag$df_peak_frag == TRUE,]
-df_peak_frag = df_peak_frag[match(cell_barcodes, df_peak_frag$tmp),]
+peak_frag = overlapsAny(peaks_gr, granges(pbmc[['ATAC']]))
+peak_frag = factor(peak_frag, levels = c(TRUE, FALSE))
+peak_frag = as.data.frame(table(peak_frag, tmp))
+peak_frag = peak_frag[peak_frag$peak_frag == TRUE,]
+peak_frag = peak_frag[match(cell_barcodes, peak_frag$tmp),]
 gc()
 gc()
+df_frag_qc_cell_lvl$peak_frag <- peak_frag$Freq
 
 ### check fragments within blacklisted regions ----------
-df_bl_frag = overlapsAny(data, blacklist_hg38_unified)
-df_bl_frag = as.data.frame(table(df_bl_frag, tmp))
-df_bl_frag = df_bl_frag[df_bl_frag$df_bl_frag == TRUE,]
-df_bl_frag = df_bl_frag[match(cell_barcodes, df_bl_frag$tmp),]
+bl_frag = overlapsAny(peaks_gr, blacklist_hg38_unified)
+bl_frag = factor(bl_frag, levels = c(TRUE, FALSE))
+bl_frag = as.data.frame(table(bl_frag, tmp))
+bl_frag = bl_frag[bl_frag$bl_frag == TRUE,]
+bl_frag = bl_frag[match(cell_barcodes, bl_frag$tmp),]
 gc()
 gc()
-
+df_frag_qc_cell_lvl$bl_frag <- bl_frag$Freq
 
 ### check fragments within standard chromosomes ----------
 chromosomes_to_keep <- c(paste0("chr", 1:22), "chrX")
-df_chr_frag = seqnames(data) %in% chromosomes_to_keep
-df_chr_frag = as.vector(df_chr_frag)
-df_chr_frag = as.data.frame(table(df_chr_frag, tmp))
-df_chr_frag = df_chr_frag[df_chr_frag$df_chr_frag == TRUE,]
-df_chr_frag = df_chr_frag[match(cell_barcodes, df_chr_frag$tmp),]
+std_chr_frag = seqnames(peaks_gr) %in% chromosomes_to_keep
+std_chr_frag = as.vector(std_chr_frag)
+std_chr_frag = factor(std_chr_frag, levels = c(TRUE, FALSE))
+std_chr_frag = as.data.frame(table(std_chr_frag, tmp))
+std_chr_frag = std_chr_frag[std_chr_frag$std_chr_frag == TRUE,]
+std_chr_frag = std_chr_frag[match(cell_barcodes, std_chr_frag$tmp),]
 gc()
 gc()
+df_frag_qc_cell_lvl$std_chr_frag <- std_chr_frag$Freq
 
 ### check fragments within chrMT ----------
-chromosomes_to_keep <- c("chrMT")
-df_chrMT_frag = seqnames(data) %in% chromosomes_to_keep
-df_chrMT_frag = as.vector(df_chrMT_frag)
-df_chrMT_frag = as.data.frame(table(df_chrMT_frag, tmp))
-df_chrMT_frag = df_chrMT_frag[df_chrMT_frag$df_chrMT_frag == TRUE,]
-df_chrMT_frag = df_chrMT_frag[match(cell_barcodes, df_chrMT_frag$tmp),] # if all output is NA, that means all values are 0
+chromosomes_to_keep <- c("chrMT") # fragment information directly derived from cellranger output fragment.tsv.gz
+chrmt_frag = seqnames(peaks_gr) %in% chromosomes_to_keep
+chrmt_frag = as.vector(chrmt_frag)
+chrmt_frag = factor(chrmt_frag, levels = c(TRUE, FALSE))
+chrmt_frag = as.data.frame(table(chrmt_frag, tmp))
+chrmt_frag = chrmt_frag[chrmt_frag$chrmt_frag == TRUE,]
+chrmt_frag = chrmt_frag[match(cell_barcodes, chrmt_frag$tmp),]
 gc()
 gc()
+df_frag_qc_cell_lvl$chrmt_frag <- chrmt_frag$Freq
 
-write.csv(df_chrMT_frag, str_c(data_save, "df_chrMT_frag.csv"), row.names = FALSE)
-write.csv(df_chr_frag, str_c(data_save, "df_chr_frag.csv"), row.names = FALSE)
-write.csv(df_peak_frag, str_c(data_save, "df_peak_frag.csv"), row.names = FALSE)
-write.csv(df_bl_frag, str_c(data_save, "df_bl_frag.csv"), row.names = FALSE)
 
-### check fragments within genomic reptitive elements (optioonal) ----------
+### check fragments within genomic reptitive elements (optional) ----------
 ### very computationally intensive
+calculate_repetitive_element_frag = function(peaks_gr,
+                                             peaks_gr_barcodes,
+                                             repeats_hg38,
+                                             cell_barcodes,
+                                             chr_change = TRUE,
+                                             category){
+  # pay attention to diff. between UCSC and Ensembl chr nomenclature
+  if (chr_change) {
+    seqlevels(repeats_hg38)[seqlevels(repeats_hg38) == "chrM"] <- "chrMT"
+  }
+  
+  # Classify repeats by type
+  high_confidence_removes <- c("Simple_repeat", "Low_complexity", "Satellite", 
+                               "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA")
+  
+  moderate_removes <- c("LINE", "SINE", "LTR")  # More controversial
+  
+  keep_types <- c("DNA", "RC")  # Often contain regulatory elements
+  
+  
+  # choose test_gr
+  if (category == "all"){
+    test_gr = repeats_hg38
+  } else if (category %in% c("high_confidence_removes", "moderate_removes", "keep_types")) {
+    test_gr = switch(category,
+                     'high_confidence_removes' = repeats_hg38[repeats_hg38$repClass %in% high_confidence_removes,],
+                     'moderate_removes' = repeats_hg38[repeats_hg38$repClass %in% moderate_removes,],
+                     'keep_types' = repeats_hg38[repeats_hg38$repClass %in% keep_types,])
+    
+  } else if (category %in% c("Simple_repeat", "Low_complexity", "Satellite", 
+                       "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA",
+                       "LINE", "SINE", "LTR", "DNA", "RC")) {
+    test_gr = repeats_hg38[repeats_hg38$repClass == category,]
+  } else {
+    stop("Invalid category specified.")
+  }
+  
+  
+  # Select specific category of repetitive elements
+  peak_frag = overlapsAny(peaks_gr, test_gr)
+  peak_frag = factor(peak_frag, levels = c(TRUE, FALSE))
+  peak_frag = as.data.frame(table(peak_frag, peaks_gr_barcodes))
+  peak_frag = peak_frag[peak_frag$peak_frag == TRUE,]
+  peak_frag = peak_frag[match(cell_barcodes, peak_frag$peaks_gr_barcodes),]
+  gc()
+  gc()
+  
+  return(peak_frag)
+}
+
+
+# Classify repeats by type
+high_confidence_removes <- c("Simple_repeat", "Low_complexity", "Satellite", 
+                             "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA")
+
+moderate_removes <- c("LINE", "SINE", "LTR")  # More controversial
+
+keep_types <- c("DNA", "RC")  # Often contain regulatory elements
+
+
+for (i in c("all", 
+           "high_confidence_removes", 
+           "moderate_removes", 
+           "keep_types",
+           "Simple_repeat", "Low_complexity", "Satellite", 
+           "tRNA", "rRNA", "scRNA", "snRNA", "srpRNA",
+           "LINE", "SINE", "LTR", "DNA", "RC")) {
+  
+  rep_frag = calculate_repetitive_element_frag(
+    peaks_gr = peaks_gr,
+    peaks_gr_barcodes = tmp,
+    repeats_hg38 = repeats_hg38,
+    cell_barcodes = cell_barcodes,
+    chr_change = TRUE,
+    category = i
+  )
+  
+  df_frag_qc_cell_lvl[paste0(i, '_frag_rep')] <- rep_frag$Freq
+  
+}
+
 
 
 ### check nucleosome signal and TSS enrichment -------
 pbmc <- NucleosomeSignal(pbmc)
 pbmc <- TSSEnrichment(pbmc)
+df_frag_qc_cell_lvl$TSS.enrichment = pbmc$TSS.enrichment
+df_frag_qc_cell_lvl$nucleosome_signal = pbmc$nucleosome_signal
+df_frag_qc_cell_lvl$TSS.percentile = pbmc$TSS.percentile
+df_frag_qc_cell_lvl$nucleosome_percentile = pbmc$nucleosome_percentile
+df_frag_qc_cell_lvl$nCount_ATAC = pbmc$nCount_ATAC
+df_frag_qc_cell_lvl$nFeature_ATAC = pbmc$nFeature_ATAC
+
+### calculation of ratios ---------
+for (i in colnames(df_frag_qc_cell_lvl)[!(colnames(df_frag_qc_cell_lvl) %in% c("TSS.enrichment", "nucleosome_signal", "TSS.percentile", "nucleosome_percentile", "fragments", "nCount_ATAC", "nFeature_ATAC"))]){
+  df_frag_qc_cell_lvl[[str_c(i,'_ratio')]] = df_frag_qc_cell_lvl[[i]]/df_frag_qc_cell_lvl[['fragments']]
+}
 
 
-# Integrate QC metrics into metadata --------------
-# df_chrMT_frag = read.csv(str_c(data_save, "df_chrMT_frag.csv"))
-# df_chr_frag = read.csv(str_c(data_save, "df_chr_frag.csv"))
-# df_peak_frag = read.csv(str_c(data_save, "df_peak_frag.csv"))
-# df_bl_frag = read.csv(str_c(data_save, "df_bl_frag.csv"))
-# df_cell_peak = read.csv(str_c(data_save, "cell_level_peak_qc.csv"))
+### save frag QC results for cells ---------
+write.csv(
+  df_frag_qc_cell_lvl,
+  file = str_c(data_save, "cell_level_frag_qc.csv"),
+  row.names = TRUE
+)
 
-pbmc$fragments <- frag_summary$frequency_count
-pbmc$peak_frag_ratio <- df_peak_frag$Freq/pbmc$fragments
-pbmc$blacklist_frag_ratio <- df_bl_frag$Freq/pbmc$fragments
-pbmc$standard_chr_frag_ratio <- df_chr_frag$Freq/pbmc$fragments
-pbmc$chrMT_frag_ratio <- 0/pbmc$fragments
-pbmc@meta.data <- cbind(pbmc@meta.data, df_cell_peak[,-1])
 
-df_atac_qc_cell_lvl = pbmc@meta.data[,!grepl('(nCount_RNA)|(nFeature_RNA)', colnames(pbmc@meta.data))]
 
 ## visualization of QC metrics ----------
+rm(list=ls())
+gc()
+
+data_read = "../data/"
+analysis_save = "../analysis/"
+data_save = "../data/"
+
+df_peak_qc_cell_lvl = read.csv(
+  str_c(data_read, "cell_level_peak_qc.csv"),
+  row.name = 1
+)
+
+df_frag_qc_cell_lvl = read.csv(
+  str_c(data_read, "cell_level_frag_qc.csv"),
+  row.name = 1
+)
+
+df_atac_qc_cell_lvl = cbind(df_peak_qc_cell_lvl, df_frag_qc_cell_lvl)
+df_atac_qc_cell_lvl$orig.ident = 'sample1'
+
+ridgeplot_clean_theme <- function() {
+  theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.line.x = element_line(color = "black", size = 0.5),
+      text = element_text(size = 12),
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10),
+      axis.text.y = element_text(size = 10),
+      legend.position = "none"
+    )
+}
+
+
+barplot_clean_theme <- function() {
+  theme_bw() +
+    theme(
+      legend.title = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.line = element_line(colour = "black", 
+                               arrow = arrow(length = unit(0.25, "cm"), type = "closed")),
+      text = element_text(size = 20)
+    )
+}
+
+
+
+
 ### cell level ----------
 ggplot(df_atac_qc_cell_lvl, 
        aes(x=fragments,fill=orig.ident))+
@@ -615,64 +863,81 @@ ggsave(
 )
 
 
-qc_metrics = c("peak_frag_ratio", 
-               "blacklist_frag_ratio", 
-               "standard_chr_frag_ratio", 
-               "chrMT_frag_ratio",
-               "peak_std_chr_ratio", 
-               "peak_black_ratio", 
-               "peak_chrmt_ratio", 
-               "high_confidence_removes_rep",
-               "moderate_removes_rep", 
-               "keep_types_rep",
+qc_metrics = c("std_chr", 
+               "chrmt", 
+               "blacklist",
+               "peak_frag", 
+               "bl_frag",
+               "std_chr_frag",
+               "chrmt_frag", 
+               "peak_frag_ratio",
+               "bl_frag_ratio", 
+               "std_chr_frag_ratio",
+               "chrmt_frag_ratio",
                "nucleosome_signal", 
-               "TSS.enrichment")
+               "TSS.enrichment",
+               "nucleosome_percentile",
+               "TSS.percentile")
 
-names(qc_metrics) = c("Rario of fragments within peaks",
-                      "Ratio of blacklisted fragments",
-                      "Ratio of fragments within standard chromosome (chr1-22, chrX)",
-                      "Ratio of fragments within chrMT ",
-                      "Ratio of peaks within standard chromosomes",
-                      "Ratio of peaks within blacklisted regions",
+names(qc_metrics) = c("Ratio of peaks within standard chromosomes",
                       "Ratio of peaks within chrMT",
-                      "Ratio of peaks within repetitive elements(microsatellites, tandem repeats, etc.)",
-                      "Ratio of peaks within repetitive elements(LINEs, SINEs and LTRs)",
-                      "Ratio of peaks within other repetitive elements(DNA transponsons and Rolling circle elements)",
-                      "Nucleosome signal", 
-                      "TSS enrichment")
+                      "Ratio of peaks within blacklisted regions",
+                      "# of fragments within peaks",
+                      "# of fragments within blacklisted regions",
+                      "# of fragments within standard chromosomes",
+                      "# of fragments within chrMT",
+                      "Ratio of fragments within peaks",
+                      "Ratio of fragments within blacklisted regions",
+                      "Ratio of fragments within standard chromosomes",
+                      "Ratio of fragments within chrMT",
+                      "Nucleosome signal",
+                      "TSS enrichment",
+                      "Nucleosome percentile",
+                      "TSS percentile")
 
 
 graphics.off()
 for (i in unname(qc_metrics)) {
   cut_off = switch(i,
+                   "std_chr" = 0.95, 
+                   "chrmt" = 0.05, 
+                   "blacklist" = 0.01,
+                   "peak_frag"= 500, 
+                   "bl_frag"= NULL,
+                   "std_chr_frag" = NULL,
+                   "chrmt_frag" = NULL, 
                    "peak_frag_ratio" = 0.4,
-                   "blacklist_frag_ratio" = 0.05,
-                   "standard_chr_frag_ratio" = 0.95,
-                   "chrMT_frag_ratio" = 0.05,
-                   "peak_std_chr_ratio" = 0.95,
-                   "peak_black_ratio" = 0.05,
-                   "peak_chrmt_ratio" = 0.05,
-                   "high_confidence_removes_rep" = 0,
-                   "moderate_removes_rep" = 0,
-                   "keep_types_rep" = 0,
-                   "nucleosome_signal" = 2,
-                   "TSS.enrichment" = 1
+                   "bl_frag_ratio" = 0.01, 
+                   "std_chr_frag_ratio" = 0.95,
+                   "chrmt_frag_ratio" = 0.05,
+                   "nucleosome_signal" = 2, 
+                   "TSS.enrichment" = 1,
+                   "nucleosome_percentile" = 0.7,
+                   "TSS.percentile" = 0.7
                    )
   
   linecolor = switch(i,
+                     "std_chr" = "blue", 
+                     "chrmt" = "red", 
+                     "blacklist" = "red",
+                     "peak_frag" = "blue", 
+                     "bl_frag" = "",
+                     "std_chr_frag" = "",
+                     "chrmt_frag" = "", 
                      "peak_frag_ratio" = "blue",
-                     "blacklist_frag_ratio" = "red",
-                     "standard_chr_frag_ratio" = "blue",
-                     "chrMT_frag_ratio" = "red",
-                     "peak_std_chr_ratio" = "blue",
-                     "peak_black_ratio" = "red",
-                     "peak_chrmt_ratio" = "red",
-                     "high_confidence_removes_rep" = "blue",
-                     "moderate_removes_rep" = "blue",
-                     "keep_types_rep" = "blue",
-                     "nucleosome_signal" = "red",
-                     "TSS.enrichment" = "red"
+                     "bl_frag_ratio" = "blue", 
+                     "std_chr_frag_ratio" = "blue",
+                     "chrmt_frag_ratio" = "blue",
+                     "nucleosome_signal" = "red", 
+                     "TSS.enrichment" = "red",
+                     "nucleosome_percentile" = "blue",
+                     "TSS.percentile" = "blue"
                      )
+  
+  if (length(unique(df_atac_qc_cell_lvl[[i]])) == 1) {
+    print(paste("Skipping", i, "as all values are same."))
+    next
+  }
   
   ggplot(df_atac_qc_cell_lvl, 
          aes_string(x=i,fill='orig.ident'))+
@@ -690,6 +955,8 @@ for (i in unname(qc_metrics)) {
 }
 
 
+#### rep -------------
+##### peak ratios in rep -------------
 qc_genomic_metrics = c("all repetitive elements",
                                "repetitive elements(microsatellites, tandem repeats, etc.)",
                                "repetitive elements(LINEs, SINEs and LTRs)",
@@ -727,6 +994,7 @@ names(qc_genomic_metrics) = c("all_rep",
                        "RC_rep")
 
 df = df_atac_qc_cell_lvl[,names(qc_genomic_metrics)]
+df <- df[, !sapply(df, function(col) length(unique(col)) == 1)]
 df = tidyr::pivot_longer(df, 
                         cols = everything(), 
                         names_to = "QC_metric_rep", 
@@ -754,9 +1022,146 @@ ggsave(
 )
 
 
+
+##### fragments # in rep -------------
+qc_genomic_metrics = c("all repetitive elements",
+                       "repetitive elements(microsatellites, tandem repeats, etc.)",
+                       "repetitive elements(LINEs, SINEs and LTRs)",
+                       "repetitive elements(DNA transponsons and Rolling circle elements)",
+                       "microsatellites",
+                       "low complexity regions",
+                       "satellite DNA",
+                       "tRNA genes",
+                       "rRNA genes",
+                       "scRNA genes",
+                       "snRNA genes",
+                       "srpRNA genes",
+                       "LINEs",
+                       "SINEs",
+                       "LTRs",
+                       "DNA transposons",
+                       "Rolling circle elements")
+
+names(qc_genomic_metrics) = c("all_frag_rep", 
+                              "high_confidence_removes_frag_rep", 
+                              "moderate_removes_frag_rep", 
+                              "keep_types_frag_rep",
+                              "Simple_repeat_frag_rep",
+                              "Low_complexity_frag_rep",
+                              "Satellite_frag_rep",
+                              "tRNA_frag_rep",
+                              "rRNA_frag_rep",
+                              "scRNA_frag_rep",
+                              "snRNA_frag_rep",
+                              "srpRNA_frag_rep",
+                              "LINE_frag_rep",
+                              "SINE_frag_rep",
+                              "LTR_frag_rep",
+                              "DNA_frag_rep",
+                              "RC_frag_rep")
+
+df = df_atac_qc_cell_lvl[,names(qc_genomic_metrics)]
+df <- df[, !sapply(df, function(col) length(unique(col)) == 1)]
+df = tidyr::pivot_longer(df, 
+                         cols = everything(), 
+                         names_to = "QC_metric_rep", 
+                         values_to = "Ratio")
+df$QC_metric_rep <- factor(df$QC_metric_rep, 
+                           levels = names(qc_genomic_metrics))
+
+
+
+graphics.off()
+ggplot(df, 
+       aes_string(x="Ratio",
+                  fill='QC_metric_rep'))+
+  geom_density()+scale_x_log10()+
+  facet_wrap(~ QC_metric_rep, 
+             labeller = labeller(QC_metric_rep = qc_genomic_metrics), 
+             scales = "free_y", ncol=4) +
+  
+  ggtitle("Distribution of # of fragments within genomic repetitive elements")+
+  xlab("")+
+  ridgeplot_clean_theme()
+
+ggsave(
+  str_c(analysis_save, "Number_frag_of_genomic_rep_summary_cell_lvl.pdf"),
+  width = 20, height = 8
+)
+
+##### fragments ratios in rep -------------
+qc_genomic_metrics = c("all repetitive elements",
+                       "repetitive elements(microsatellites, tandem repeats, etc.)",
+                       "repetitive elements(LINEs, SINEs and LTRs)",
+                       "repetitive elements(DNA transponsons and Rolling circle elements)",
+                       "microsatellites",
+                       "low complexity regions",
+                       "satellite DNA",
+                       "tRNA genes",
+                       "rRNA genes",
+                       "scRNA genes",
+                       "snRNA genes",
+                       "srpRNA genes",
+                       "LINEs",
+                       "SINEs",
+                       "LTRs",
+                       "DNA transposons",
+                       "Rolling circle elements")
+
+names(qc_genomic_metrics) = c("all_frag_rep_ratio", 
+                              "high_confidence_removes_frag_rep_ratio", 
+                              "moderate_removes_frag_rep_ratio", 
+                              "keep_types_frag_rep_ratio",
+                              "Simple_repeat_frag_rep_ratio",
+                              "Low_complexity_frag_rep_ratio",
+                              "Satellite_frag_rep_ratio",
+                              "tRNA_frag_rep_ratio",
+                              "rRNA_frag_rep_ratio",
+                              "scRNA_frag_rep_ratio",
+                              "snRNA_frag_rep_ratio",
+                              "srpRNA_frag_rep_ratio",
+                              "LINE_frag_rep_ratio",
+                              "SINE_frag_rep_ratio",
+                              "LTR_frag_rep_ratio",
+                              "DNA_frag_rep_ratio",
+                              "RC_frag_rep_ratio")
+
+df = df_atac_qc_cell_lvl[,names(qc_genomic_metrics)]
+df <- df[, !sapply(df, function(col) length(unique(col)) == 1)]
+df = tidyr::pivot_longer(df, 
+                         cols = everything(), 
+                         names_to = "QC_metric_rep", 
+                         values_to = "Ratio")
+df$QC_metric_rep <- factor(df$QC_metric_rep, 
+                           levels = names(qc_genomic_metrics))
+
+
+
+graphics.off()
+ggplot(df, 
+       aes_string(x="Ratio",
+                  fill='QC_metric_rep'))+
+  geom_density()+
+  facet_wrap(~ QC_metric_rep, 
+             labeller = labeller(QC_metric_rep = qc_genomic_metrics), 
+             scales = "free_y", ncol=4) +
+  
+  ggtitle("Distribution of # of fragments within genomic repetitive elements")+
+  xlab("")+
+  ridgeplot_clean_theme()
+
+ggsave(
+  str_c(analysis_save, "Ratio_frag_of_genomic_rep_summary_cell_lvl.pdf"),
+  width = 20, height = 8
+)
+
+
+
+
+
 ### peak level ----------
-# df_peak_qc = read.csv(str_c(data_save, "peak_level_peak_qc.csv"), row.names = 1)
-# df_peak_qc$peak_cat = rownames(df_peak_qc)
+df_peak_qc = read.csv(str_c(data_save, "peak_level_peak_qc_summary.csv"), row.names = 1)
+df_peak_qc$peak_cat = rownames(df_peak_qc)
 
 peak_qc = c("Ratio of peaks within standard chromosomes",
                    "Ratio of peaks within blacklisted regions",
@@ -779,9 +1184,9 @@ peak_qc = c("Ratio of peaks within standard chromosomes",
                    "Ratio of peaks within DNA transposons",
                    "Ratio of peaks within Rolling circle elements")
 
-names(peak_qc) = c("peak_std_chr_ratio", 
-            "peak_black_ratio", 
-            "peak_chrmt_ratio",
+names(peak_qc) = c("std_chr", 
+            "blacklist", 
+            "chrmt",
             "all_rep",
             "high_confidence_removes_rep",
             "moderate_removes_rep", 
@@ -819,8 +1224,11 @@ ggsave(
   width = 20, height = 6
 )
 
-df_peak_qc_peak_name$orig.ident = unique(pbmc@meta.data$orig.ident)
-ggplot(df_peak_qc_peak_name, 
+
+
+df_peak_qc_peak_lvl = read.csv(str_c(data_save, "peak_level_peak_qc.csv"), row.names = 1)
+df_peak_qc_peak_lvl$orig.ident = "sample1"
+ggplot(df_peak_qc_peak_lvl, 
        aes_string(x="peak_cell_ratio",fill='orig.ident'))+
   geom_density()+
   geom_vline(xintercept = 0.01, linetype = "dashed", color = "red", linewidth = 1)+
@@ -831,7 +1239,7 @@ ggplot(df_peak_qc_peak_name,
 ggsave(str_c(analysis_save, "cell_per_peak_ratio_peak_lvl.pdf"),
        width = 8, height = 6)
 
-ggplot(df_peak_qc_peak_name, 
+ggplot(df_peak_qc_peak_lvl, 
        aes_string(x="peak_cell",fill='orig.ident'))+
   geom_density()+
   geom_vline(xintercept = 5, linetype = "dashed", color = "red", linewidth = 1)+
@@ -842,7 +1250,7 @@ ggplot(df_peak_qc_peak_name,
 ggsave(str_c(analysis_save, "cell_per_peak_peak_lvl.pdf"),
        width = 8, height = 6)
 
-ggplot(df_peak_qc_peak_name, 
+ggplot(df_peak_qc_peak_lvl, 
        aes_string(x="peak_reads",fill='orig.ident'))+
   geom_density()+
   geom_vline(xintercept = 100, linetype = "dashed", color = "red", linewidth = 1)+
@@ -854,7 +1262,7 @@ ggplot(df_peak_qc_peak_name,
 ggsave(str_c(analysis_save, "peak_reads_peak_lvl.pdf"),
        width = 8, height = 6)
 
-ggplot(df_peak_qc_peak_name, 
+ggplot(df_peak_qc_peak_lvl, 
        aes_string(x="peak_width",fill='orig.ident'))+
   geom_density()+
   geom_vline(xintercept = 200, linetype = "dashed", color = "blue", linewidth = 1)+
@@ -869,10 +1277,10 @@ ggsave(str_c(analysis_save, "peak_width_peak_lvl.pdf"),
 
 
 ## filter cells and peaks based on QC metrics --------------
-df_atac_qc_summary = data.frame(row.names = unique(pbmc$orig.ident),
-                                nCells_before = ncol(pbmc),
+df_atac_qc_summary = data.frame(row.names = unique(df_atac_qc_cell_lvl$orig.ident),
+                                nCells_before = nrow(df_atac_qc_cell_lvl),
                                 nCells_after = NA,
-                                nPeaks = nrow(pbmc[['ATAC']]),
+                                nPeaks = nrow(df_peak_qc_peak_lvl),
                                 nPeaks_after = NA)
 
 
@@ -881,30 +1289,30 @@ keep_atacseq = df_atac_qc_cell_lvl$fragments > 1000 &
   df_atac_qc_cell_lvl$nCount_ATAC < 100000 &
   df_atac_qc_cell_lvl$nFeature_ATAC > 1000 & 
   df_atac_qc_cell_lvl$peak_frag_ratio > 0.4 & 
-  df_atac_qc_cell_lvl$blacklist_frag_ratio < 0.05 & 
-  df_atac_qc_cell_lvl$standard_chr_frag_ratio > 0.95 & 
-  df_atac_qc_cell_lvl$chrMT_frag_ratio < 0.05 & 
-  df_atac_qc_cell_lvl$peak_std_chr_ratio > 0.95 & 
-  df_atac_qc_cell_lvl$peak_black_ratio < 0.05 & 
-  df_atac_qc_cell_lvl$peak_chrmt_ratio < 0.05 &
-  pbmc$nucleosome_signal < 2 &
-  pbmc$TSS.enrichment > 1
+  df_atac_qc_cell_lvl$bl_frag_ratio < 0.01 & 
+  df_atac_qc_cell_lvl$std_chr_frag_ratio > 0.95 & 
+  df_atac_qc_cell_lvl$chrmt_frag_ratio < 0.05 & 
+  df_atac_qc_cell_lvl$std_chr > 0.95 & 
+  df_atac_qc_cell_lvl$blacklist < 0.01 & 
+  df_atac_qc_cell_lvl$chrmt < 0.05 &
+  df_atac_qc_cell_lvl$nucleosome_signal < 2 &
+  df_atac_qc_cell_lvl$TSS.enrichment > 1
 
 df_cell_atac_qc = data.frame(
-  row.names = colnames(pbmc),
+  row.names = rownames(df_atac_qc_cell_lvl),
   keep_atacseq_cell = keep_atacseq
 )
 
 
-keep_atacseq_peak = df_peak_qc_peak_name$peak_cell_ratio > 0.01 & 
-  df_peak_qc_peak_name$peak_cell > 5 & 
-  df_peak_qc_peak_name$peak_reads > 100 & 
-  df_peak_qc_peak_name$peak_std_chr == TRUE & 
-  df_peak_qc_peak_name$peak_black_ratio == FALSE & 
-  df_peak_qc_peak_name$peak_chrMT == FALSE
+keep_atacseq_peak = df_peak_qc_peak_lvl$peak_cell_ratio > 0.01 & 
+  df_peak_qc_peak_lvl$peak_cell > 5 & 
+  df_peak_qc_peak_lvl$peak_reads > 100 & 
+  df_peak_qc_peak_lvl$std_chr == TRUE & 
+  df_peak_qc_peak_lvl$blacklist == FALSE & 
+  df_peak_qc_peak_lvl$chrmt == FALSE
 
 df_peak_atac_qc = data.frame(
-  row.names = rownames(pbmc),
+  row.names = rownames(df_peak_qc_peak_lvl),
   keep_atacseq_peak = keep_atacseq_peak
 )
 
@@ -929,13 +1337,412 @@ write.csv(
   row.names = TRUE
 )
 
-## scRNA-seq ----------
-DefaultAssay(pbmc) <- "RNA"
+# QC for scRNAseq ----------
+rm(list = ls())
+gc()
+
+
+data_read = "../data/"
+analysis_save = "../analysis/"
+data_save = "../data/"
+counts <- Read10X_h5(str_c(data_read,"pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5"))
+
+
+seurat_obj <- CreateSeuratObject(
+  counts = counts$`Gene Expression`,
+  assay = "RNA",
+  min.cells = 0,
+  min.features = 0
+)
+
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevels(annotation) <- paste0('chr', seqlevels(annotation))
 
 
 
+## cell level ---------
+seurat_obj$log10GenesPerUMI <- log10(seurat_obj$nFeature_RNA)/log10(seurat_obj$nCount_RNA)
+seurat_obj$mitoRatio <- PercentageFeatureSet(object = seurat_obj, pattern = "^MT-")
+seurat_obj$mitoRatio <- seurat_obj$mitoRatio / 100
+
+df <- seurat_obj@meta.data
+df <- df %>% dplyr::rename(nUMI = nCount_RNA, nGene = nFeature_RNA)
+
+# UMI count distribution
+p1 <- ggplot(df, aes(color=orig.ident, x=nUMI, fill=orig.ident)) + 
+  geom_density() + 
+  scale_x_log10() + 
+  theme_classic() +
+  xlab("# of UMIs") +
+  NoLegend()+
+  geom_vline(xintercept = 500)
+ggsave(file.path(analysis_save, paste0("QC_Cell_Density_UMI.pdf")),
+       plot = p1, width = 8, height = 7)
+
+# Gene count distribution
+p2 <- df %>% 
+  ggplot(aes(color=orig.ident, x=nGene, fill=orig.ident)) + 
+  geom_density() + 
+  theme_classic() +
+  scale_x_log10() +
+  xlab("# of genes")+
+  NoLegend()+
+  geom_vline(xintercept = 300)
+ggsave(file.path(analysis_save, paste0("QC_Cell_Density_genes.pdf")),
+       plot = p2, width = 8, height = 7)
+
+# Mitochondrial ratio distribution
+p3 <- df %>% 
+  ggplot(aes(color=orig.ident, x=mitoRatio, fill=orig.ident)) + 
+  geom_density() +
+  theme_classic() +
+  xlab("Mitochondrial ratio") +
+  NoLegend()+
+  geom_vline(xintercept = 0.25)
+ggsave(file.path(analysis_save, paste0("QC_Cell_Density_mitoRatio.pdf")),
+       plot = p3, width = 8, height = 7)
+
+# Scatter plot of nUMI vs nGene colored by mitoRatio
+p4 <- df %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point(aes(size=log10GenesPerUMI)) + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  geom_smooth(method = "lm") +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  xlab("# of UMIs") +
+  ylab("# of genes") +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 300)
+ggsave(file.path(analysis_save, paste0("QC_Cell_correlations.pdf")),
+       plot = p4, width = 8, height = 7)
+
+# Gene complexity
+p5 <- df %>%
+  ggplot(aes(x=log10GenesPerUMI, color=orig.ident, fill=orig.ident)) +
+  geom_density() +
+  theme_classic() +
+  xlab("log10(Genes per UMI)") +
+  NoLegend()+
+  geom_vline(xintercept = 0.8)
+ggsave(file.path(analysis_save, paste0("QC_Cell_complexity.pdf")),
+       plot = p5, width = 8, height = 7)
+
+write.csv(
+  df,
+  file = str_c(data_save, "cell_level_rna_qc.csv"),
+  row.names = TRUE
+)
+
+## gene level -----------
+counts <- GetAssayData(object = seurat_obj, layer = "counts")
+nonzero <- counts > 0
+
+df_gene_qc <- data.frame(
+  row.names = rownames(counts),
+  nCells = Matrix::rowSums(nonzero),
+  nCells_ratio = Matrix::rowSums(nonzero) / ncol(counts),
+  nCounts = Matrix::rowSums(counts)
+)
+
+tmp = annotation[seqnames(annotation) == 'chrMT']
+df_gene_qc$mito = rownames(df_gene_qc) %in% tmp$gene_name
+tmp = annotation[seqnames(annotation) %in% c(paste0("chr", 1:22), "chrX")]
+df_gene_qc$std_chr = rownames(df_gene_qc) %in% tmp$gene_name
+df_gene_qc$orig.ident = 'sample1'
 
 
+p1 <- df_gene_qc %>%
+  ggplot(aes(x=nCells, color=orig.ident, fill=orig.ident)) +
+  geom_density() +
+  theme_classic() +
+  scale_x_log10() +
+  NoLegend()+
+  xlab("# of cells expressing gene") +
+  geom_vline(xintercept = 10)
+ggsave(file.path(analysis_save, paste0("QC_gene_nCells.pdf")),
+       plot = p1, width = 8, height = 7)
+
+
+p2 <- df_gene_qc %>%
+  ggplot(aes(x=nCells_ratio, color=orig.ident, fill=orig.ident)) +
+  geom_density() +
+  theme_classic() +
+  scale_x_log10() +
+  NoLegend()+
+  xlab("Ratio of cells expressing gene") +
+  geom_vline(xintercept = 0.01)
+ggsave(file.path(analysis_save, paste0("QC_gene_nCells_ratio.pdf")),
+       plot = p2, width = 8, height = 7)
+
+p3 <- df_gene_qc %>%
+  ggplot(aes(x=nCounts, color=orig.ident, fill=orig.ident)) +
+  geom_density() +
+  theme_classic() +
+  scale_x_log10() +
+  NoLegend()+
+  xlab("# of counts for gene") +
+  geom_vline(xintercept = 10)
+ggsave(file.path(analysis_save, paste0("QC_gene_nCounts.pdf")),
+       plot = p3, width = 8, height = 7)
+
+
+
+## filter cells and genes -----------
+df_rna_qc_summary = data.frame(row.names = "sample1",
+                                nCells_before = nrow(df),
+                                nCells_after = NA,
+                                nGenes = nrow(df_gene_qc),
+                                nGenes_after = NA)
+
+keep_rnaseq = df$nUMI > 500 & 
+  df$nGene > 300 & 
+  df$mitoRatio < 0.25 & 
+  df$log10GenesPerUMI > 0.8
+
+df_cell_rna_qc = data.frame(row.names = rownames(df),
+                            keep_rnaseq_cell = keep_rnaseq)
+
+df_gene_rna_qc = data.frame(
+  row.names = rownames(df_gene_qc),
+  keep_rnaseq_gene = df_gene_qc$nCells_ratio > 0.01 & 
+    df_gene_qc$nCells > 10 & 
+    df_gene_qc$nCounts > 10 & 
+    df_gene_qc$std_chr == TRUE & 
+    df_gene_qc$mito == FALSE
+)
+
+df_rna_qc_summary['nCells_after'] <- sum(keep_rnaseq)
+df_rna_qc_summary['nGenes_after'] <- sum(df_gene_rna_qc$keep_rnaseq_gene)
+
+write.csv(
+  df_rna_qc_summary,
+  file = str_c(data_save, "df_rna_qc_summary.csv"),
+  row.names = TRUE
+)
+
+write.csv(
+  df_cell_rna_qc,
+  file = str_c(data_save, "df_cell_rna_keep.csv"),
+  row.names = TRUE
+)
+
+write.csv(
+  df_gene_rna_qc,
+  file = str_c(data_save, "df_gene_rna_keep.csv"),
+  row.names = TRUE
+)
+
+
+# Integrated filtering based on scRNAseq and scATACseq ----------
+rm(list = ls())
+gc()
+
+data_read = "../data/"
+analysis_save = "../analysis/"
+data_save = "../data/"
+counts <- Read10X_h5(str_c(data_read,"pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5"))
+fragpath <- str_c(data_read,"pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz")
+
+df_cell_rna_keep = read.csv(
+  str_c(data_save, "df_cell_rna_keep.csv"),
+  row.names = 1
+)
+
+df_cell_atac_keep = read.csv(
+  str_c(data_save, "df_cell_atac_keep.csv"),
+  row.names = 1
+)
+
+df_gene_rna_keep = read.csv(
+  str_c(data_save, "df_gene_rna_keep.csv"),
+  row.names = 1
+)
+
+df_peak_atac_keep = read.csv(
+  str_c(data_save, "df_peak_atac_keep.csv"),
+  row.names = 1
+)
+
+## check rownames and colnames are identical ---------
+identical(
+  rownames(df_cell_rna_keep), 
+  rownames(df_cell_atac_keep)
+)
+
+identical(
+  rownames(df_cell_rna_keep), 
+  colnames(counts$`Gene Expression`)
+)
+
+identical(
+  rownames(df_peak_atac_keep), 
+  rownames(counts$`Peaks`)
+)
+
+
+identical(
+  rownames(df_gene_rna_keep), 
+  rownames(counts$`Gene Expression`)
+)
+
+
+## filter cells based on scRNAseq and scATACseq QC metrics ---------
+df_integrated_qc_summary = data.frame(
+  row.names = "sample1",
+  nCells = nrow(df_cell_rna_keep),
+  nCells_after = NA,
+  nPeaks = nrow(df_peak_atac_keep),
+  nPeaks_after = NA,
+  nGenes = nrow(df_gene_rna_keep),
+  nGenes_after = NA
+)
+
+keep_cells = df_cell_rna_keep$keep_rnaseq_cell & 
+  df_cell_atac_keep$keep_atacseq_cell
+
+keep_genes = df_gene_rna_keep$keep_rnaseq_gene
+
+keep_peaks = df_peak_atac_keep$keep_atacseq_peak
+
+keep_gene_expr = counts$`Gene Expression`[keep_genes, keep_cells]
+keep_peak_expr = counts$`Peaks`[keep_peaks, keep_cells]
+
+df_integrated_qc_summary['nCells_after'] <- sum(keep_cells)
+df_integrated_qc_summary['nPeaks_after'] <- sum(keep_peaks)
+df_integrated_qc_summary['nGenes_after'] <- sum(keep_genes)
+
+write.csv(
+  df_integrated_qc_summary,
+  file = str_c(data_save, "df_integrated_qc_summary.csv"),
+  row.names = TRUE
+)
+
+
+## create a filtered seurat object ---------
+seuratObj <- CreateSeuratObject(
+  counts = keep_gene_expr,
+  assay = "RNA",
+  min.cells = 0,
+  min.features = 0
+)
+
+
+fragpath <- str_c(data_read,"pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz")
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevels(annotation) <- paste0('chr', seqlevels(annotation))
+seuratObj[["ATAC"]] <- CreateChromatinAssay(
+  counts = keep_peak_expr,
+  sep = c(":", "-"),
+  fragments = fragpath,
+  annotation = annotation
+)
+
+saveRDS(
+  seuratObj,
+  file = str_c(data_save, "seuratObj_filtered.rds")
+)
+
+
+## visualization for integrated filtering -------
+barplot_clean_theme <- function() {
+  theme_bw() +
+    theme(
+      legend.title = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      axis.line = element_line(colour = "black", 
+                               arrow = arrow(length = unit(0.25, "cm"), type = "closed")),
+      text = element_text(size = 20)
+    )
+}
+
+df_integrated_qc_summary = as.data.frame(t(df_integrated_qc_summary))
+df_integrated_qc_summary$metric = rownames(df_integrated_qc_summary)
+df_integrated_qc_summary$metric = factor(df_integrated_qc_summary$metric, 
+                                                levels = c("nCells", "nCells_after", 
+                                                           "nPeaks", "nPeaks_after", 
+                                                           "nGenes", "nGenes_after"))
+df_integrated_qc_summary$cat = c("Cells",
+                                  "Cells",
+                                  "Peaks",
+                                  "Peaks",
+                                  "Genes",
+                                  "Genes")
+
+library(patchwork)  # Make sure to load patchwork for combining plots
+
+# Create individual plots for each category
+p1 <- df_integrated_qc_summary %>%
+  filter(cat == "Cells") %>%
+  ggplot(aes_string(x="metric", y="sample1", fill = "metric")) +
+  geom_bar(stat = "identity") +
+  ggtitle("Cells") +
+  xlab("") +
+  ylab("") +
+  scale_fill_discrete(labels = c( 
+    "nCells" = "# of cells before filtering", 
+    "nCells_after" = "# of cells after filtering", 
+    "nPeaks" = "# of peaks before filtering", 
+    "nPeaks_after" = "# of peaks after filtering", 
+    "nGenes" = "# of genes before filtering", 
+    "nGenes_after" = "# of genes after filtering" 
+  )) +
+  barplot_clean_theme() +
+  theme(axis.text.x = element_blank()) +
+  scale_x_discrete(drop = TRUE)
+
+p2 <- df_integrated_qc_summary %>%
+  filter(cat == "Genes") %>%
+  ggplot(aes_string(x="metric", y="sample1", fill = "metric")) +
+  geom_bar(stat = "identity") +
+  ggtitle("Genes") +
+  xlab("") +
+  ylab("") +
+  scale_fill_discrete(labels = c( 
+    "nCells" = "# of cells before filtering", 
+    "nCells_after" = "# of cells after filtering", 
+    "nPeaks" = "# of peaks before filtering", 
+    "nPeaks_after" = "# of peaks after filtering", 
+    "nGenes" = "# of genes before filtering", 
+    "nGenes_after" = "# of genes after filtering" 
+  )) +
+  barplot_clean_theme() +
+  theme(axis.text.x = element_blank()) +
+  scale_x_discrete(drop = TRUE)
+
+p3 <- df_integrated_qc_summary %>%
+  filter(cat == "Peaks") %>%
+  ggplot(aes_string(x="metric", y="sample1", fill = "metric")) +
+  geom_bar(stat = "identity") +
+  ggtitle("Peaks") +
+  xlab("") +
+  ylab("") +
+  scale_fill_discrete(labels = c( 
+    "nCells" = "# of cells before filtering", 
+    "nCells_after" = "# of cells after filtering", 
+    "nPeaks" = "# of peaks before filtering", 
+    "nPeaks_after" = "# of peaks after filtering", 
+    "nGenes" = "# of genes before filtering", 
+    "nGenes_after" = "# of genes after filtering" 
+  )) +
+  barplot_clean_theme() +
+  theme(axis.text.x = element_blank()) +
+  scale_x_discrete(drop = TRUE)
+
+# Combine plots with a shared legend
+combined_plot <- p1 + p2 + p3 + 
+  plot_layout(ncol = 3, guides = "collect") +
+  plot_annotation(title = "Summary of QC metrics after integrated filtering")
+
+# Display the combined plot
+ggsave(
+  str_c(analysis_save, "integrated_qc_summary.pdf"),
+  plot = combined_plot,
+  width = 12, height = 6
+)
 
 
 
