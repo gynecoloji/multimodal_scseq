@@ -1,4 +1,4 @@
-# Detailed Joint scATAC-seq&scRNAseq analysis with Seurat and Signac
+# Detailed Joint scATAC-seq&scRNAseq analysis with Seurat and Signac for QC
 
 # load required packages ---------
 library(Signac)
@@ -20,20 +20,24 @@ library(vroom)
 library(GenomeInfoDb)
 library(ggplot2)
 library(patchwork)
+library(DoubletFinder)
+library(scDblFinder)
 
 # QC for scATACseq ----------
-data_read = "../data/"
-analysis_save = "../analysis/"
-data_save = "../data/"
-counts <- Read10X_h5(str_c(data_read,"pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5"))
-fragpath <- str_c(data_read,"pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz")
+data_read <- "../data/"
+analysis_save <- "../analysis/"
+data_save <- "../data/"
+counts <- Read10X_h5(str_c(data_read,
+                           "pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5"))
+fragpath <- str_c(data_read,
+                  "pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz")
 
 
 ah <- AnnotationHub()
 query(ah, c("RepeatMasker", "Homo sapiens"))
 repeats_hg38 <- ah[["AH99003"]]
-repeats_hg38 <- repeats_hg38[!grepl("\\?", repeats_hg38$repClass),]
-repeats_hg38 <- repeats_hg38[!grepl("Unknown", repeats_hg38$repClass),]
+repeats_hg38 <- repeats_hg38[!grepl("\\?", repeats_hg38$repClass), ]
+repeats_hg38 <- repeats_hg38[!grepl("Unknown", repeats_hg38$repClass), ]
 # because non-uniform nomenclature for chromosomes except for chr1-22, chrX, chrY and chrM, we just discard them.
 repeats_hg38 <- repeats_hg38[seqnames(repeats_hg38) %in% c(paste0("chr", 1:22), "chrX", "chrY", "chrM"),]
 repeats_hg38 <- keepSeqlevels(repeats_hg38, c(paste0("chr", 1:22), "chrX", "chrY", "chrM"), pruning.mode = "coarse")
@@ -183,6 +187,7 @@ peak_bl_ratio = Matrix::colSums(filtered_peaks)/Matrix::colSums(counts$Peaks)
 tmp = as.data.frame(peak_bl_ratio)
 colnames(tmp) <- 'blacklist'
 df_peak_qc_cell_lvl = cbind(df_peak_qc_cell_lvl,tmp)
+
 
 ### save peak QC results for cells -----------
 write.csv(
@@ -763,7 +768,21 @@ write.csv(
   row.names = TRUE
 )
 
+## doublet detection -----------------
+counts <- Read10X_h5(str_c(data_read,
+                           "pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5"))
+sce <- scDblFinder(SingleCellExperiment(list(counts = counts$Peaks)),
+                   clusters = NULL, 
+                   aggregateFeatures = TRUE, nfeatures = 25,
+                   processing = "normFeatures")
+df_doublet_qc <- data.frame(row.names = colnames(counts$Peaks),
+                            DF_atac_score = sce$scDblFinder.score,
+                            DF_atac_classification = sce$scDblFinder.class)
 
+write.csv(
+  df_doublet_qc,
+  file = str_c(data_save, "cell_level_doublet_qc.csv")
+)
 
 ## visualization of QC metrics ----------
 rm(list=ls())
@@ -772,6 +791,7 @@ gc()
 data_read = "../data/"
 analysis_save = "../analysis/"
 data_save = "../data/"
+
 
 df_peak_qc_cell_lvl = read.csv(
   str_c(data_read, "cell_level_peak_qc.csv"),
@@ -783,7 +803,13 @@ df_frag_qc_cell_lvl = read.csv(
   row.name = 1
 )
 
-df_atac_qc_cell_lvl = cbind(df_peak_qc_cell_lvl, df_frag_qc_cell_lvl)
+df_DF_qc_cell_lvl = read.csv(
+  str_c(data_save, "cell_level_doublet_qc.csv"),
+  row.name = 1
+)
+
+
+df_atac_qc_cell_lvl = cbind(df_peak_qc_cell_lvl, df_frag_qc_cell_lvl, df_DF_qc_cell_lvl)
 df_atac_qc_cell_lvl$orig.ident = 'sample1'
 
 ridgeplot_clean_theme <- function() {
@@ -818,6 +844,17 @@ barplot_clean_theme <- function() {
 
 
 ### cell level ----------
+df_atac_qc_cell_lvl %>%
+  ggplot(aes(x=DF_atac_classification, fill=DF_atac_classification)) +
+  geom_bar(stat = "count") +
+  theme_classic() +
+  xlab("Duplication rate") +
+  NoLegend()
+ggsave(file.path(analysis_save, paste0("QC_DF_atac.pdf")), width = 4, height = 7)
+
+
+
+
 ggplot(df_atac_qc_cell_lvl, 
        aes(x=fragments,fill=orig.ident))+
   geom_density()+
@@ -938,7 +975,7 @@ for (i in unname(qc_metrics)) {
     print(paste("Skipping", i, "as all values are same."))
     next
   }
-  
+
   ggplot(df_atac_qc_cell_lvl, 
          aes_string(x=i,fill='orig.ident'))+
     geom_density()+
@@ -947,7 +984,7 @@ for (i in unname(qc_metrics)) {
     ggtitle(str_c("Distribution of data"))+
     xlab(names(qc_metrics)[qc_metrics == i])+
     ridgeplot_clean_theme()
-  
+
   ggsave(
     str_c(analysis_save, i, ".pdf"),
     width = 8, height = 6
@@ -1296,7 +1333,8 @@ keep_atacseq = df_atac_qc_cell_lvl$fragments > 1000 &
   df_atac_qc_cell_lvl$blacklist < 0.01 & 
   df_atac_qc_cell_lvl$chrmt < 0.05 &
   df_atac_qc_cell_lvl$nucleosome_signal < 2 &
-  df_atac_qc_cell_lvl$TSS.enrichment > 1
+  df_atac_qc_cell_lvl$TSS.enrichment > 1 &
+  df_atac_qc_cell_lvl$DF_atac_classification == "singlet"
 
 df_cell_atac_qc = data.frame(
   row.names = rownames(df_atac_qc_cell_lvl),
@@ -1361,17 +1399,17 @@ seqlevels(annotation) <- paste0('chr', seqlevels(annotation))
 
 
 ## cell level ---------
-seurat_obj$log10GenesPerUMI <- log10(seurat_obj$nFeature_RNA)/log10(seurat_obj$nCount_RNA)
-seurat_obj$mitoRatio <- PercentageFeatureSet(object = seurat_obj, pattern = "^MT-")
+seurat_obj$log10GenesPerUMI <- log10(seurat_obj$nFeature_RNA) / log10(seurat_obj$nCount_RNA) # nolint: line_length_linter.
+seurat_obj$mitoRatio <- PercentageFeatureSet(object = seurat_obj, pattern = "^MT-") # nolint: line_length_linter.
 seurat_obj$mitoRatio <- seurat_obj$mitoRatio / 100
 
 df <- seurat_obj@meta.data
 df <- df %>% dplyr::rename(nUMI = nCount_RNA, nGene = nFeature_RNA)
 
 # UMI count distribution
-p1 <- ggplot(df, aes(color=orig.ident, x=nUMI, fill=orig.ident)) + 
-  geom_density() + 
-  scale_x_log10() + 
+p1 <- ggplot(df, aes(color=orig.ident, x=nUMI, fill=orig.ident)) +
+  geom_density() +
+  scale_x_log10() +
   theme_classic() +
   xlab("# of UMIs") +
   NoLegend()+
@@ -1428,6 +1466,64 @@ p5 <- df %>%
   geom_vline(xintercept = 0.8)
 ggsave(file.path(analysis_save, paste0("QC_Cell_complexity.pdf")),
        plot = p5, width = 8, height = 7)
+
+## doublet decteion
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:10)
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:10)
+seurat_obj <- FindClusters(seurat_obj)
+
+sweep.res <- paramSweep(seurat_obj, PCs = 1:10, sct = FALSE)
+sweep.stats <- summarizeSweep(sweep.res, GT = FALSE)
+bcmvn <- find.pK(sweep.stats)
+
+best_pK <- bcmvn$pK[which.max(bcmvn$BCmetric)]
+best_pK <- as.numeric(as.character(best_pK[[1]]))
+
+seu_clusters <- seurat_obj@meta.data$seurat_clusters # use the clusters as the user-defined cell types
+homotypic.prop <- modelHomotypic(seu_clusters)
+
+multiplet_rate = NULL
+if(is.null(multiplet_rate)){
+  print('multiplet_rate not provided....... estimating multiplet rate from cells in dataset')
+  
+  # 10X multiplet rates table
+  #https://rpubs.com/kenneditodd/doublet_finder_example
+  multiplet_rates_10x <- data.frame('Multiplet_rate'= c(0.004, 0.008, 0.0160, 0.023, 0.031, 0.039, 0.046, 0.054, 0.061, 0.069, 0.076),
+                                    'Loaded_cells' = c(800, 1600, 3200, 4800, 6400, 8000, 9600, 11200, 12800, 14400, 16000),
+                                    'Recovered_cells' = c(500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000))
+  
+  print(multiplet_rates_10x)
+  
+  multiplet_rate <- multiplet_rates_10x %>% dplyr::filter(Recovered_cells < nrow(seurat_obj@meta.data)) %>% 
+    dplyr::slice(which.max(Recovered_cells)) %>% # select the min threshold depending on your number of samples
+    dplyr::select(Multiplet_rate) %>% as.numeric(as.character()) # get the expected multiplet rate for that number of recovered cells
+
+  print(paste('Setting multiplet rate to', multiplet_rate))
+}
+
+nExp.poi <- round(multiplet_rate * nrow(seurat_obj@meta.data)) # multiply by number of cells to get the number of expected multiplets
+nExp.poi.adj <- round(nExp.poi * (1 - homotypic.prop)) # expected number of doublets
+
+seurat_obj <- doubletFinder(seu = seurat_obj,
+                        PCs = 1:10,
+                        pK = best_pK,
+                        nExp = nExp.poi.adj)
+df$DF = seurat_obj@meta.data[, grepl('DF.classifications', colnames(seurat_obj@meta.data))]
+
+# duplication rate
+p6 <- df %>%
+  ggplot(aes(x=DF, fill=DF)) +
+  geom_bar(stat = "count") +
+  theme_classic() +
+  xlab("Duplication rate") +
+  NoLegend()
+ggsave(file.path(analysis_save, paste0("QC_DF.pdf")),
+       plot = p6, width = 4, height = 7)
+
 
 write.csv(
   df,
@@ -1489,6 +1585,7 @@ ggsave(file.path(analysis_save, paste0("QC_gene_nCounts.pdf")),
 
 
 
+
 ## filter cells and genes -----------
 df_rna_qc_summary = data.frame(row.names = "sample1",
                                 nCells_before = nrow(df),
@@ -1496,10 +1593,11 @@ df_rna_qc_summary = data.frame(row.names = "sample1",
                                 nGenes = nrow(df_gene_qc),
                                 nGenes_after = NA)
 
-keep_rnaseq = df$nUMI > 500 & 
-  df$nGene > 300 & 
-  df$mitoRatio < 0.25 & 
-  df$log10GenesPerUMI > 0.8
+keep_rnaseq <- df$nUMI > 500 & 
+  df$nGene > 300 &
+  df$mitoRatio < 0.25 &
+  df$log10GenesPerUMI > 0.8 &
+  df$DF == "Singlet"
 
 df_cell_rna_qc = data.frame(row.names = rownames(df),
                             keep_rnaseq_cell = keep_rnaseq)
