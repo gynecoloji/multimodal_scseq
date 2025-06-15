@@ -2,6 +2,7 @@
 library(Signac)
 library(Seurat)
 library(EnsDb.Hsapiens.v86)
+library(hdf5r)
 library(BSgenome.Hsapiens.UCSC.hg38)
 library(ConsensusClusterPlus)
 library(aricode)
@@ -18,16 +19,17 @@ library(vroom)
 library(GenomeInfoDb)
 library(ggplot2)
 library(patchwork)
+library(cowplot)
 
 # load data ---------
-
+setwd("./script/")
 data_read = "../data/"
 analysis_save = "../analysis/"
 data_save = "../data/"
 
 seuratObj = readRDS(paste0(data_read, "seuratObj_filtered.rds"))
 
-# gene expression & atac data analysis (normalization) ----------
+# normalization ----------
 DefaultAssay(seuratObj) <- "RNA"
 seuratObj <- SCTransform(seuratObj)
 seuratObj <- RunPCA(seuratObj)
@@ -37,9 +39,9 @@ seuratObj <- FindTopFeatures(seuratObj, min.cutoff = 5)
 seuratObj <- RunTFIDF(seuratObj)
 seuratObj <- RunSVD(seuratObj)
 
-
-# weight calculations based on joint atac and rna seq----------
-## joint weight calculations (output wknn, wsnn and neighbor object (weight.nn)) ---------
+# weight calculations ----------
+## joint weight calculations  ---------
+# (output wknn, wsnn and neighbor object (weight.nn))
 DefaultAssay(seuratObj) <- "SCT"
 seuratObj <- FindMultiModalNeighbors(
   object = seuratObj,
@@ -49,16 +51,14 @@ seuratObj <- FindMultiModalNeighbors(
   verbose = TRUE
 )
 
-
-## weight calculations based on atac and rna seq respectively  ---------
+## invididual weight calculations  ---------
 ### use return.neighbor = TRUE to get the neighbor object but you should set
 ### compute.SNN = FALSE to avoid computing SNN graph at the same time
-### please pay attention to nomenclature for sct.nn/atac.nn (You cannot use the same name as you use in graph object)
+### please pay attention to nomenclature for sct.nn/atac.nn 
+### (You cannot use the same name as you use in graph object)
 
 ### SCT -----------
-
 DefaultAssay(seuratObj) <- "SCT"  # or "RNA"
-
 
 seuratObj <- FindNeighbors(
   object = seuratObj,
@@ -107,9 +107,6 @@ seuratObj <- FindNeighbors(
   return.neighbor = FALSE
 )
 
-
-
-
 # clustering ------------
 ## based on RNA data only ------
 seuratObj <- FindClusters(
@@ -118,7 +115,6 @@ seuratObj <- FindClusters(
   resolution = 0.5,
   cluster.name = "SCT_clusters"
 )
-
 
 ## based on ATAC data only ------
 seuratObj <- FindClusters(
@@ -138,7 +134,6 @@ seuratObj <- FindClusters(
   cluster.name = "weighted_clusters"
 )
 
-
 ## build a joint UMAP visualization ----------
 # Using weighted k-nearest neighbors (most common for multimodal)
 seuratObj <- RunUMAP(
@@ -148,7 +143,6 @@ seuratObj <- RunUMAP(
   reduction.key = "wnnUMAP_",
   verbose = TRUE
 )
-
 
 # SCT-based UMAPs (SCT-transformed data)
 seuratObj <- RunUMAP(
@@ -168,15 +162,22 @@ seuratObj <- RunUMAP(
   verbose = TRUE
 )
 
-
-
-
-# visualization of clustering results ---------
+## visualization of clustering results ---------
 DefaultAssay(seuratObj) <- "SCT"
-DimPlot(seuratObj, label = TRUE, repel = TRUE, reduction = "wnn.umap") + NoLegend()
-DimPlot(seuratObj, label = TRUE, repel = TRUE, reduction = "sct.umap") + NoLegend()
-DimPlot(seuratObj, label = TRUE, repel = TRUE, reduction = "atac.umap") + NoLegend()
+p1 = DimPlot(seuratObj, label = TRUE, repel = TRUE,
+             reduction = "wnn.umap",
+             group.by = "weighted_clusters") + NoLegend()
+p2 = DimPlot(seuratObj, label = TRUE, repel = TRUE,
+             reduction = "sct.umap",
+             group.by = "SCT_clusters") + NoLegend()
+p3 = DimPlot(seuratObj, label = TRUE, repel = TRUE, 
+             reduction = "atac.umap",
+             group.by = "ATAC_clusters") + NoLegend()
 
+graphics.off()
+pdf(str_c(analysis_save, "UMAP_summary.pdf"), width = 20, height = 6)
+plot_grid(p1, p2, p3, ncol = 3)
+dev.off()
 
 # clustering evaluation based on different clustering usage ---------
 # Create consensus clustering from multiple methods
@@ -293,17 +294,22 @@ plot_pairwise_metrics <- function(results) {
   par(mfrow = c(1, 1))
 }
 
-
 pairwise_results <- pairwise_clustering_metrics(cluster_list)
+
+graphics.off()
+pdf(str_c(analysis_save, "pairwise_clustering_metrics.pdf"),
+    height = 10,
+    width = 20)
 plot_pairwise_metrics(pairwise_results)
+dev.off()
 
 # Save results ----------
 saveRDS(seuratObj, file = paste0(data_save, "seuratObj_with_clustering.rds"))
 
-## Load required library ---------
-library(hdf5r)
+# Save h5ad ---------
 dir.create(paste0(data_save, "for_python"), showWarnings = FALSE)
-python_save = paste0(data_save, "for_python/multiome_normalized.h5")
+python_save_rnaseq = paste0(data_save, "for_python/rnaseq_normalized.h5")
+python_save_atacseq = paste0(data_save, "for_python/atacseq_normalized.h5")
 
 ## Extract the data --------
 rna_counts <- GetAssayData(seuratObj, assay = "RNA", slot = "counts")
@@ -315,7 +321,11 @@ metadata <- cbind(metadata, Embeddings(seuratObj))
 metadata <- cbind(metadata, Embeddings(seuratObj, reduction = "wnn.umap"))
 metadata <- cbind(metadata, Embeddings(seuratObj, reduction = "sct.umap"))
 metadata <- cbind(metadata, Embeddings(seuratObj, reduction = "atac.umap"))
-
+for(col in colnames(metadata)) {
+  if(is.factor(metadata[[col]])) {
+    metadata[[col]] <- as.character(metadata[[col]])
+  }
+}
 
 rna_counts <- as.matrix(rna_counts)
 rna_data <- as.matrix(rna_data)
@@ -324,48 +334,38 @@ atac_data <- as.matrix(atac_data)
 gc()
 gc()
 
-
-h5file <- H5File$new(python_save, mode = "w")
-
+## h5ad file saving --------
+### rnaseq -------
+h5file <- H5File$new(python_save_rnaseq, mode = "w")
 
 h5file[["rna_counts"]] <- rna_counts
 h5file[["rna_normalized"]] <- rna_data
+h5file[["rna_gene_names"]] <- rownames(rna_counts)
+h5file[["cell_names"]] <- colnames(rna_counts)
 
-
-h5file[["atac_counts"]] <- atac_counts
-h5file[["atac_normalized"]] <- atac_data
-
-
-
-## Save metadata -----------
-# Convert factors to characters first
-for(col in colnames(metadata)) {
-  if(is.factor(metadata[[col]])) {
-    metadata[[col]] <- as.character(metadata[[col]])
-  }
-}
-
-# Save each metadata column
 metadata_group <- h5file$create_group("metadata")
-for(col in colnames(metadata)) {
+for (col in colnames(metadata)) {
   metadata_group[[col]] <- metadata[[col]]
 }
 
-# Save row and column names
-h5file[["rna_gene_names"]] <- rownames(rna_counts)
-h5file[["atac_feature_names"]] <- rownames(atac_counts)
-h5file[["cell_names"]] <- colnames(rna_counts)
-
-## Close file -------
 h5file$close_all()
 
-cat("Data saved to multimodal_data.h5\n")
+### atacseq -------
+h5file <- H5File$new(python_save_atacseq, mode = "w")
+
+h5file[["atac_counts"]] <- atac_counts
+h5file[["atac_normalized"]] <- atac_data
+h5file[["atac_feature_names"]] <- rownames(atac_counts)
+h5file[["cell_names"]] <- colnames(atac_counts)
+
+metadata_group <- h5file$create_group("metadata")
+for (col in colnames(metadata)) {
+  metadata_group[[col]] <- metadata[[col]]
+}
+
+h5file$close_all()
+
+
+cat("Data saved to rnaseq/atacseq_normalized.h5 files\n")
 cat("Matrices saved: rna_counts, rna_normalized, atac_counts, atac_normalized\n")
 cat("Metadata saved in metadata/ group\n")
-
-
-
-
-
-
-
