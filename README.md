@@ -22,6 +22,7 @@ Welcome! This repository contains a complete walkthrough of our project.
 ---
 
 ## 📂 Folder Structure
+```
 ├── README.md          # Main guide (this file)
 ├── 01-intro.md        # Project overview
 ├── 02-data.md         # Data collection & cleaning
@@ -30,7 +31,7 @@ Welcome! This repository contains a complete walkthrough of our project.
 ├── analysis/          # Analysis results (empty)
 ├── script/            # scripts folder including R scripts
 └── data/              # Data files (Not shown)
-
+```
 
 ---
 
