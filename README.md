@@ -6,10 +6,10 @@ Welcome! This repository contains a complete walkthrough of our project.
 
 ## 📚 Table of Contents
 
-1. [Project Introduction](./01-QC.md)
-2. [Data Description & Preprocessing](./02-clustering.md)
-3. [Analysis Methods](./03-linkage.md)
-4. [Results & Interpretation](./04-motif.md)
+1. [Quality Control](./01-QC.md)
+2. [Clustering](./02-clustering.md)
+3. [Linking Genes and Peaks](./03-linkage.md)
+4. [Motif Analysis](./04-motif.md)
 
 ---
 
