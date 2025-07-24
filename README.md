@@ -22,13 +22,14 @@ Welcome! This repository contains a complete walkthrough of our project.
 ---
 
 ## 📂 Folder Structure
-├── README.md # Main guide (this file)
-├── 01-intro.md # Project overview
-├── 02-data.md # Data collection & cleaning
-├── 03-analysis.md # Computational analysis
-├── 04-results.md # Visualization and interpretation
-├── analysis/ # analysis results
-└── data/ # data
+├── README.md          # Main guide (this file)
+├── 01-intro.md        # Project overview
+├── 02-data.md         # Data collection & cleaning
+├── 03-analysis.md     # Computational analysis
+├── 04-results.md      # Visualization and interpretation
+├── analysis/          # Analysis results (empty)
+├── script/            # scripts folder including R scripts
+└── data/              # Data files (Not shown)
 
 
 ---
